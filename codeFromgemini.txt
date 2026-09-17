@@ -1,0 +1,102 @@
+#include "ads1299parser.h"
+#include <cmath>
+
+ADS1299Parser::ADS1299Parser(QObject *parent) : QObject(parent) {
+    // 默认按照 ADS1299 典型配置：Vref = 4.5V, Gain = 24
+    setHardwareConfig(4.5, 24);
+}
+
+void ADS1299Parser::setHardwareConfig(double vref, int gain) {
+    updateLsbScale(vref, gain);
+}
+
+void ADS1299Parser::updateLsbScale(double vref, int gain) {
+    // ADS1299 为 24 位 ADC，最高位为符号位，最大正刻度为 2^23 - 1
+    // 1 LSB (V) = Vref / (Gain * (2^23 - 1))
+    // 乘以 1e6 转换为微伏 (uV)
+    m_lsbScale = (vref / (gain * (std::pow(2, 23) - 1))) * 1000000.0;
+}
+
+void ADS1299Parser::parseRawData(const QByteArray &rawData) {
+    // 1. 追加新收到的原始字节到缓存区末尾
+    m_buffer.append(rawData);
+
+    // 2. 循环处理，直到缓存区数据不足一帧
+    while (m_buffer.size() >= FRAME_SIZE) {
+        // 查找帧头 0xA5 0x5A
+        int headerIndex = -1;
+        for (int i = 0; i <= m_buffer.size() - FRAME_SIZE; ++i) {
+            if (static_cast<uint8_t>(m_buffer[i]) == HEADER_0 &&
+                static_cast<uint8_t>(m_buffer[i + 1]) == HEADER_1) {
+                headerIndex = i;
+                break;
+            }
+        }
+
+        // 没找到帧头：清除大部分无效数据，仅保留最后 1 字节（防止帧头被切断）
+        if (headerIndex == -1) {
+            m_buffer = m_buffer.right(1);
+            break;
+        }
+
+        // 找到了帧头，但不在开头：扔掉帧头前面的废数据，实现帧同步
+        if (headerIndex > 0) {
+            m_buffer.remove(0, headerIndex);
+        }
+
+        // 再次检查剩余数据长度是否满足一帧
+        if (m_buffer.size() < FRAME_SIZE) {
+            break; // 长度不够，等待下一次串口接收
+        }
+
+        // 3. 校验帧数据有效性（XOR 校验）
+        if (verifyChecksum(m_buffer)) {
+            QVector<double> channelsuV(8);
+
+            // 提取 8 个通道的数据，从第 5 字节开始（Header 2B + Status 3B = Offset 5）
+            for (int ch = 0; ch < 8; ++ch) {
+                int offset = 5 + ch * 3;
+                uint8_t b0 = static_cast<uint8_t>(m_buffer[offset]);
+                uint8_t b1 = static_cast<uint8_t>(m_buffer[offset + 1]);
+                uint8_t b2 = static_cast<uint8_t>(m_buffer[offset + 2]);
+
+                channelsuV[ch] = convert24ToMicrovolts(b0, b1, b2);
+            }
+
+            // 解析成功，发送信号把数据广播出去
+            emit channelsParsed(channelsuV);
+
+            // 移出已成功解析的一帧数据
+            m_buffer.remove(0, FRAME_SIZE);
+        } else {
+            // 校验失败（坏帧）：丢弃帧头 1 字节，继续向下重新寻找帧头
+            m_buffer.remove(0, 1);
+        }
+    }
+}
+
+// 核心转换逻辑：24 位有符号补码转 int32_t 并换算为 uV
+double ADS1299Parser::convert24ToMicrovolts(uint8_t b0, uint8_t b1, uint8_t b2) const {
+    // 1. 拼接成 24 位无符号整数 (高位在前 MSB First)
+    int32_t raw24 = (static_cast<int32_t>(b0) << 16) |
+                    (static_cast<int32_t>(b1) << 8)  |
+                     static_cast<int32_t>(b2);
+
+    // 2. 符号位拓展 (Sign Extension)
+    // 检查第 23 位（即 0x800000）是否为 1。如果为 1，说明是负数，高 8 位补 1 (0xFF000000)
+    if (raw24 & 0x800000) {
+        raw24 |= 0xFF000000;
+    }
+
+    // 3. 乘以 LSB 比例因子得出微伏 (uV)
+    return raw24 * m_lsbScale;
+}
+
+// 示例校验和函数：对帧头及数据部分做异或 (XOR)
+bool ADS1299Parser::verifyChecksum(const QByteArray &frame) const {
+    uint8_t checksum = 0;
+    for (int i = 0; i < FRAME_SIZE - 1; ++i) {
+        checksum ^= static_cast<uint8_t>(frame[i]);
+    }
+    return checksum == static_cast<uint8_t>(frame[FRAME_SIZE - 1]);
+}
